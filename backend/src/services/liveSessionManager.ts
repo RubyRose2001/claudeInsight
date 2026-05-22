@@ -8,7 +8,7 @@ import { spawn as ptySpawn, IPty } from 'node-pty';
 import { EventEmitter } from 'events';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
-import { createReadStream, existsSync, readdirSync } from 'fs';
+import { createReadStream, existsSync, readdirSync, statSync } from 'fs';
 import { createInterface } from 'readline';
 import { join } from 'path';
 import { platform } from 'os';
@@ -33,16 +33,95 @@ const DEFAULT_ROWS = 30;
 const OUTPUT_BUFFER_LIMIT = 256 * 1024;
 
 /**
+ * 扫描 nvm/fnm/n 等 node 版本管理器下安装的 claude bin 目录。
+ * 按目录 mtime 倒序返回（最近用过的版本优先）。仅作为登录 shell 探测失败后的兜底。
+ */
+function listNodeVersionManagerBins(home: string): string[] {
+  const roots = [
+    `${home}/.nvm/versions/node`,
+    `${home}/.fnm/node-versions`,
+    `${home}/.local/share/fnm/node-versions`,
+    `${home}/Library/Application Support/fnm/node-versions`,
+    `${home}/n/versions/node`,
+    '/usr/local/n/versions/node',
+  ];
+  const found: { path: string; mtime: number }[] = [];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    let versions: string[];
+    try {
+      versions = readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const v of versions) {
+      // fnm 的目录结构是 versions/<v>/installation/bin，nvm/n 是 versions/<v>/bin
+      const binCandidates = [join(root, v, 'bin'), join(root, v, 'installation', 'bin')];
+      for (const bin of binCandidates) {
+        if (!existsSync(bin)) continue;
+        try {
+          const st = statSync(bin);
+          found.push({ path: bin, mtime: st.mtimeMs });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  found.sort((a, b) => b.mtime - a.mtime);
+  return found.map((x) => x.path);
+}
+
+/**
+ * 一次性从用户登录 shell 中提取真实 PATH（缓存，避免每次 spawn 都跑 shell）。
+ * 思路：让 zsh/bash/fish 以登录+交互模式启动并 echo 出 PATH，
+ * 这样无论 claude 装在 nvm/fnm/volta/brew/npm-global 哪里，
+ * 只要用户在终端能跑通 `claude`，这里都能解析到。
+ *
+ * 注意：用户 rc 文件可能很重（nvm/conda/starship 等），所以超时给到 8s，
+ * 但只在第一次调用时跑一次，后续走 cache。
+ * 失败时返回 null，外层会落到候选目录兜底，不影响功能。
+ */
+let cachedLoginPath: string | null | undefined;
+function getLoginShellPath(): string | null {
+  if (cachedLoginPath !== undefined) return cachedLoginPath;
+  if (platform() === 'win32') {
+    cachedLoginPath = null;
+    return null;
+  }
+  const shell = process.env.SHELL || '/bin/zsh';
+  const marker = '__CLAUDE_INSIGHT_PATH__';
+  const cmd = `echo "${marker}$PATH${marker}"`;
+  try {
+    const out = execSync(`${shell} -ilc ${JSON.stringify(cmd)} </dev/null`, {
+      encoding: 'utf-8',
+      timeout: 8000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const m = out.match(new RegExp(`${marker}(.*?)${marker}`));
+    if (m && m[1]) {
+      cachedLoginPath = m[1];
+      return cachedLoginPath;
+    }
+  } catch {
+    // 登录 shell 不可用（容器、缺 SHELL、rc 卡死等），落到兜底
+  }
+  cachedLoginPath = null;
+  return null;
+}
+
+/**
  * 给 pty 子进程构造增强的环境变量。
- * macOS 上若 backend 不是从登录 shell 启动（例如 Electron 双击启动），
- * PATH 通常很短，找不到通过 brew / npm / volta / bun 安装的 `claude`，
- * 进而触发 `posix_spawnp failed.`。这里把常见安装目录补进 PATH。
+ * 优先把登录 shell 的真实 PATH 合并进来，让 backend 即便从 Electron/launchd 启动
+ * （非登录 shell 环境），也能拿到用户终端里的完整 PATH。
  */
 function buildSpawnEnv(): { [key: string]: string } {
   const env = { ...process.env } as { [key: string]: string };
   if (platform() === 'win32') return env;
   const home = env.HOME || '';
-  const extras = [
+  const current = (env.PATH || '').split(':').filter(Boolean);
+  const loginPath = (getLoginShellPath() || '').split(':').filter(Boolean);
+  const fallbacks = [
     '/opt/homebrew/bin',
     '/usr/local/bin',
     '/usr/bin',
@@ -51,30 +130,58 @@ function buildSpawnEnv(): { [key: string]: string } {
     `${home}/.npm-global/bin`,
     `${home}/.bun/bin`,
     `${home}/.volta/bin`,
+    ...listNodeVersionManagerBins(home),
   ];
-  const current = (env.PATH || '').split(':').filter(Boolean);
-  env.PATH = Array.from(new Set([...current, ...extras])).join(':');
+  env.PATH = Array.from(new Set([...current, ...loginPath, ...fallbacks])).join(':');
   return env;
 }
 
 /**
- * 把 `claude` 解析成绝对路径，避免 node-pty 的 posix_spawnp 找不到二进制。
- * 找不到时回退到字符串 `claude`，让 ptySpawn 自己再试一次。
+ * 把 `claude` 解析成绝对路径，避免 node-pty 的 posix_spawnp 在某些情况下找不到二进制。
+ * 解析顺序（结果缓存）：
+ *   1) 在增强 env（含 nvm/brew/volta 候选）下用 /bin/sh 的 `command -v` —— 命中即返回，毫秒级
+ *   2) 登录 shell 的 `command -v claude` —— 覆盖用户 alias 或非标准安装位置，但启动慢，作为兜底
+ *   3) 硬编码候选目录 —— 用于 shell 完全不可用的场景
+ * 都失败则返回字符串 `'claude'`，让 ptySpawn 自己再试一次。
  */
+let cachedClaudeCmd: string | undefined;
 function resolveClaudeCmd(env: { [key: string]: string }): string {
-  if (platform() === 'win32') return 'claude.cmd';
+  if (cachedClaudeCmd !== undefined) return cachedClaudeCmd;
+  if (platform() === 'win32') {
+    cachedClaudeCmd = 'claude.cmd';
+    return cachedClaudeCmd;
+  }
   try {
     const out = execSync('command -v claude', {
       encoding: 'utf-8',
       env,
       shell: '/bin/sh',
     }).trim();
-    if (out && existsSync(out)) return out;
+    if (out && existsSync(out)) {
+      cachedClaudeCmd = out;
+      return cachedClaudeCmd;
+    }
   } catch {
-    // 落到候选路径
+    // 落到下一步
+  }
+  const shell = process.env.SHELL;
+  if (shell) {
+    try {
+      const out = execSync(`${shell} -ilc 'command -v claude' </dev/null`, {
+        encoding: 'utf-8',
+        timeout: 8000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim().split('\n').pop()?.trim() || '';
+      if (out && existsSync(out)) {
+        cachedClaudeCmd = out;
+        return cachedClaudeCmd;
+      }
+    } catch {
+      // 登录 shell 不可用，落到下一步
+    }
   }
   const home = env.HOME || '';
-  const candidates = [
+  const staticCandidates = [
     '/opt/homebrew/bin/claude',
     '/usr/local/bin/claude',
     `${home}/.local/bin/claude`,
@@ -82,10 +189,15 @@ function resolveClaudeCmd(env: { [key: string]: string }): string {
     `${home}/.bun/bin/claude`,
     `${home}/.volta/bin/claude`,
   ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
+  const nvmCandidates = listNodeVersionManagerBins(home).map((bin) => join(bin, 'claude'));
+  for (const p of [...staticCandidates, ...nvmCandidates]) {
+    if (existsSync(p)) {
+      cachedClaudeCmd = p;
+      return cachedClaudeCmd;
+    }
   }
-  return 'claude';
+  cachedClaudeCmd = 'claude';
+  return cachedClaudeCmd;
 }
 
 export class LiveSessionManager {
