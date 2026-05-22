@@ -43,6 +43,11 @@ const router = createRouter({
       name: 'model-profiles',
       component: () => import('@/views/ModelProfilesView.vue'),
     },
+    {
+      path: '/live-sessions',
+      name: 'live-sessions',
+      component: () => import('@/views/LiveSessionsView.vue'),
+    },
   ],
 });
 

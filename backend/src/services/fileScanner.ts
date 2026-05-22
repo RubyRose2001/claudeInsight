@@ -1,4 +1,4 @@
-import { readdirSync, statSync, existsSync, readFileSync } from 'fs';
+import { readdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'fs';
 import { createReadStream } from 'fs';
 import { join } from 'path';
 import { createInterface } from 'readline';
@@ -195,6 +195,10 @@ export class FileScanner {
   /**
    * 解码项目路径
    * -Users-mac-Desktop----claudeManage → /Users/mac/Desktop/项目/claudeManage
+   *
+   * 注意：Claude CLI 编码会把所有非字母数字字符（含中文、冒号、下划线、点、反斜杠）
+   * 都替换成 `-`，因此解码是 lossy 的。仅在没有更可靠来源（sessions-index.json
+   * 或 jsonl 的 cwd 字段）时回退使用。
    */
   decodeProjectPath(encoded: string): string {
     // 移除开头的 -
@@ -206,29 +210,107 @@ export class FileScanner {
   }
 
   /**
-   * 获取正确的项目路径（支持中文路径）
-   * 优先从 sessions-index.json 读取 originalPath
+   * 从 jsonl 文件起始处同步读取若干 KB，解析出第一条记录的 cwd 字段
+   * 用于恢复 decodeProjectPath 无法还原的真实路径（含中文 / Windows 盘符 / 下划线等）
    */
-  resolveProjectPath(encodedPath: string): string {
-    const projectsPath = pathService.getHistoryPath();
-    const projectDir = join(projectsPath, encodedPath);
+  private extractCwdFromJsonlSync(filePath: string): string | null {
+    let fd: number | null = null;
+    try {
+      fd = openSync(filePath, 'r');
+      const buffer = Buffer.alloc(32 * 1024);
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+      if (bytesRead <= 0) return null;
 
-    // 先尝试从 sessions-index.json 读取正确的 originalPath
+      const text = buffer.subarray(0, bytesRead).toString('utf-8');
+      const lines = text.split('\n');
+      // 最后一行可能被截断，只在读满 buffer 时丢弃
+      const completeLines = bytesRead === buffer.length && lines.length > 1
+        ? lines.slice(0, -1)
+        : lines;
+
+      for (const line of completeLines) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (typeof obj.cwd === 'string' && obj.cwd.length > 0) {
+            return obj.cwd;
+          }
+        } catch {
+          // 跳过无法解析的行
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  /**
+   * 同步从项目目录下任一 jsonl 文件提取 cwd（用于回退恢复原始路径）
+   */
+  private extractCwdFromProjectDirSync(projectDir: string): string | null {
+    if (!existsSync(projectDir)) return null;
+
+    let entries: string[];
+    try {
+      entries = readdirSync(projectDir).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      return null;
+    }
+
+    for (const file of entries) {
+      const cwd = this.extractCwdFromJsonlSync(join(projectDir, file));
+      if (cwd) return cwd;
+    }
+    return null;
+  }
+
+  /** 项目编码目录 → 真实原始路径 的进程内缓存 */
+  private originalPathCache = new Map<string, string>();
+
+  /**
+   * 统一的项目原始路径解析入口
+   * 优先级：缓存 > sessions-index.json.originalPath > jsonl.cwd > 朴素 decodeProjectPath
+   */
+  private resolveOriginalPath(projectDir: string, encodedPath: string): string {
+    const cached = this.originalPathCache.get(encodedPath);
+    if (cached) return cached;
+
+    // 1. sessions-index.json
     const indexPath = join(projectDir, 'sessions-index.json');
     try {
       if (existsSync(indexPath)) {
-        const indexContent = readFileSync(indexPath, 'utf-8');
-        const indexData = JSON.parse(indexContent);
-        if (indexData.originalPath) {
+        const indexData = JSON.parse(readFileSync(indexPath, 'utf-8'));
+        if (typeof indexData.originalPath === 'string' && indexData.originalPath) {
+          this.originalPathCache.set(encodedPath, indexData.originalPath);
           return indexData.originalPath;
         }
       }
     } catch {
-      // 忽略错误，使用回退路径
+      // ignore
     }
 
-    // 回退到简单解码
+    // 2. jsonl 的 cwd 字段
+    const cwd = this.extractCwdFromProjectDirSync(projectDir);
+    if (cwd) {
+      this.originalPathCache.set(encodedPath, cwd);
+      return cwd;
+    }
+
+    // 3. lossy 解码（最后兜底）
     return this.decodeProjectPath(encodedPath);
+  }
+
+  /**
+   * 获取正确的项目路径（支持中文路径 / Windows 盘符 / 下划线等）
+   */
+  resolveProjectPath(encodedPath: string): string {
+    const projectsPath = pathService.getHistoryPath();
+    return this.resolveOriginalPath(join(projectsPath, encodedPath), encodedPath);
   }
 
   /**
@@ -259,22 +341,7 @@ export class FileScanner {
       }
 
       const projectDir = join(projectsPath, entry.name);
-      const decodedPath = this.decodeProjectPath(entry.name);
-
-      // 尝试从 sessions-index.json 读取原始路径
-      let originalPath = decodedPath;
-      const indexPath = join(projectDir, 'sessions-index.json');
-      try {
-        if (existsSync(indexPath)) {
-          const indexContent = readFileSync(indexPath, 'utf-8');
-          const indexData = JSON.parse(indexContent);
-          if (indexData.originalPath) {
-            originalPath = indexData.originalPath;
-          }
-        }
-      } catch {
-        // 如果读取失败，使用解码后的路径
-      }
+      const originalPath = this.resolveOriginalPath(projectDir, entry.name);
 
       // 扫描项目下的会话
       const sessions = this.scanProjectSessions(projectDir, originalPath);
@@ -1176,20 +1243,8 @@ export class FileScanner {
     const projectsPath = pathService.getHistoryPath();
     const projectDir = join(projectsPath, encodedPath);
 
-    // 从 sessions-index.json 读取正确的 originalPath（支持中文路径）
-    let projectPath = this.decodeProjectPath(encodedPath);
-    const indexPath = join(projectDir, 'sessions-index.json');
-    try {
-      if (existsSync(indexPath)) {
-        const indexContent = readFileSync(indexPath, 'utf-8');
-        const indexData = JSON.parse(indexContent);
-        if (indexData.originalPath) {
-          projectPath = indexData.originalPath;
-        }
-      }
-    } catch {
-      // 使用回退路径
-    }
+    // 解析项目真实路径（支持中文/Windows 盘符/下划线等 decodeProjectPath 无法还原的情况）
+    const projectPath = this.resolveOriginalPath(projectDir, encodedPath);
 
     const sessions = this.scanProjectSessions(projectDir, projectPath);
 

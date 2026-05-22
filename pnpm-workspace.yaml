@@ -1,3 +1,7 @@
 packages:
   - 'frontend'
   - 'backend'
+allowBuilds:
+  esbuild: false
+  node-pty: false
+  vue-demi: false

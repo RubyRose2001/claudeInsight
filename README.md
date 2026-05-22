@@ -95,6 +95,18 @@
 - 顶栏快速切换配置
 - 导出/导入配置方案（JSON 格式）
 
+### 实时会话 (Live Sessions)
+
+在应用内直接运行 `claude` CLI，无需切换到外部终端：
+
+- **内嵌终端**：基于 `node-pty` + `xterm.js`，通过 WebSocket 双向流式 IO
+- **多标签页**：同时运行多个 Claude 会话，按项目分组、支持自由切换
+- **新建 / Resume**：可创建全新会话（`--session-id`）或从历史记录恢复（`--resume`），恢复的会话继续写入原 JSONL
+- **项目感知 cwd**：以项目真实路径作为 pty 工作目录；当解码路径失效时，自动从历史 JSONL 的 `cwd` 字段回退解析（兼容中文 / 含冒号路径）
+- **输出回放缓冲**：每个会话保留近 256KB 输出滚动缓冲，切换 tab 重新接入时自动 replay，xterm 屏幕状态（光标、alt buffer、mouse reporting）无缝衔接
+- **窗口自适应**：前端 resize 实时同步到 pty（`resize` 协议消息）
+- **零持久化**：pty 仅在后端进程内存中管理，进程退出统一回收
+
 ### 会话导入/导出
 
 - 导出选定会话或整个项目为 ZIP
@@ -114,6 +126,8 @@
 
 - [Fastify](https://fastify.dev/) - 高性能 Web 框架
 - [TypeScript](https://www.typescriptlang.org/) - 类型安全
+- [node-pty](https://github.com/microsoft/node-pty) - 跨平台 pty 子进程（实时会话）
+- [@fastify/websocket](https://github.com/fastify/fastify-websocket) - WebSocket 双向通信
 - 无数据库设计，纯文件系统扫描
 
 ### 前端
@@ -125,6 +139,7 @@
 - [Tailwind CSS](https://tailwindcss.com/) - 实用优先 CSS
 - [Radix Vue](https://www.radix-vue.com/) - 无样式 UI 组件库
 - [Monaco Editor](https://microsoft.github.io/monaco-editor/) - 代码编辑器
+- [xterm.js](https://xtermjs.org/) - 浏览器内终端（实时会话）
 - [Chart.js](https://www.chartjs.org/) - 图表库
 - [Shiki](https://shiki.style/) - 代码高亮
 - [markdown-it](https://github.com/markdown-it/markdown-it) - Markdown 渲染
@@ -148,7 +163,8 @@ claude-insight/
 │       │   ├── config.ts           # Claude 模型配置
 │       │   ├── settings.ts         # 应用设置
 │       │   ├── stats.ts            # Dashboard 统计数据
-│       │   └── assets.ts           # 资产管理 (Agents/Commands/Styles/Plugins...)
+│       │   ├── assets.ts           # 资产管理 (Agents/Commands/Styles/Plugins...)
+│       │   └── liveSessions.ts     # 实时会话 HTTP + WebSocket 路由
 │       ├── services/
 │       │   ├── fileScanner.ts      # JSONL 会话扫描/解析/搜索/Token 统计
 │       │   ├── pathService.ts      # 路径探测
@@ -159,13 +175,14 @@ claude-insight/
 │       │   ├── assetScanner.ts     # 资产扫描
 │       │   ├── linkageService.ts   # 会话联动分析
 │       │   ├── statsService.ts     # 统计聚合服务
-│       │   └── backupService.ts    # 备份/文件历史服务
+│       │   ├── backupService.ts    # 备份/文件历史服务
+│       │   └── liveSessionManager.ts # 活跃 pty 内存管理 (node-pty)
 │       └── types/
 │           └── session.ts          # 核心类型定义
 │
 ├── frontend/                       # 前端应用
 │   └── src/
-│       ├── views/                  # 页面视图 (8 个)
+│       ├── views/                  # 页面视图 (9 个)
 │       │   ├── DashboardView.vue   # 首页概览
 │       │   ├── HistoryView.vue     # 会话浏览
 │       │   ├── CompareView.vue     # 会话对比
@@ -173,6 +190,7 @@ claude-insight/
 │       │   ├── AssetsView.vue      # 资产管理
 │       │   ├── PluginsView.vue     # 技能管理
 │       │   ├── ModelProfilesView.vue # 模型配置
+│       │   ├── LiveSessionsView.vue # 实时会话 (内嵌 claude CLI)
 │       │   └── SettingsView.vue    # 设置
 │       ├── components/             # UI 组件
 │       │   ├── conversation/       # 会话相关 (消息/工具/联动/版本)
@@ -186,6 +204,7 @@ claude-insight/
 │       │   ├── settings/           # 设置组件
 │       │   ├── model/              # 模型配置
 │       │   ├── skills/             # 技能树
+│       │   ├── live/               # 实时会话 (终端面板/会话列表)
 │       │   └── ui/                 # 通用 UI
 │       ├── stores/                 # Pinia 状态管理
 │       ├── api/                    # API 调用层
@@ -257,7 +276,7 @@ pnpm build
 ![管理配置](./frontend/public/5.png)
 ![技能管理](./frontend/public/6.png)
 ![设置](./frontend/public/7.png)
-
+![实时会话](./frontend/public/9.png)
 ## Links
 
 - [linux.do](https://linux.do/t/topic/1794151/9)
