@@ -1,12 +1,15 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
+import websocket from '@fastify/websocket';
 import settingsRoutes from './routes/settings.js';
 import historyRoutes from './routes/history.js';
 import skillsRoutes from './routes/skills.js';
 import configRoutes from './routes/config.js';
 import statsRoutes from './routes/stats.js';
 import assetsRoutes from './routes/assets.js';
+import liveSessionsRoutes from './routes/liveSessions.js';
+import fsRoutes from './routes/fs.js';
 
 export async function buildApp() {
   const fastify = Fastify({
@@ -40,6 +43,9 @@ export async function buildApp() {
     };
   });
 
+  // Register WebSocket plugin (must be registered before any route that uses it)
+  await fastify.register(websocket);
+
   // Register routes
   await fastify.register(settingsRoutes, { prefix: '/api/settings' });
   await fastify.register(historyRoutes, { prefix: '/api/history' });
@@ -47,6 +53,8 @@ export async function buildApp() {
   await fastify.register(configRoutes, { prefix: '/api/config' });
   await fastify.register(statsRoutes, { prefix: '/api/stats' });
   await fastify.register(assetsRoutes, { prefix: '/api/assets' });
+  await fastify.register(liveSessionsRoutes, { prefix: '/api/live-sessions' });
+  await fastify.register(fsRoutes, { prefix: '/api/fs' });
 
   return fastify;
 }

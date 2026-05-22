@@ -30,21 +30,33 @@ export const useSearchStore = defineStore('search', () => {
     error.value = null;
 
     try {
-      // 并行搜索会话和资产
-      const [sessionResponse, agents, commands, skillsRes] = await Promise.all([
-        historyApi.search(searchQuery, page, pagination.value.pageSize),
-        assetsApi.getAgents(),
-        assetsApi.getCommands(),
-        skillsApi.getTree('global'),
-      ]);
+      // 并行搜索会话和资产；任一旁支失败不影响主线（会话）结果
+      const [sessionSettled, agentsSettled, commandsSettled, skillsSettled] =
+        await Promise.allSettled([
+          historyApi.search(searchQuery, page, pagination.value.pageSize),
+          assetsApi.getAgents(),
+          assetsApi.getCommands(),
+          skillsApi.getTree('global'),
+        ]);
 
-      const skills = (skillsRes as any).tree || [];
+      const sessionResponse =
+        sessionSettled.status === 'fulfilled' ? sessionSettled.value : null;
+      const agents = agentsSettled.status === 'fulfilled' ? agentsSettled.value : [];
+      const commands =
+        commandsSettled.status === 'fulfilled' ? commandsSettled.value : [];
+      // skills 接口返回 { tree: SkillTreeNode }，根节点是分类包装，真正可搜的是 children
+      const skills =
+        skillsSettled.status === 'fulfilled'
+          ? skillsSettled.value?.tree?.children ?? []
+          : [];
 
       const allResults: SearchResult[] = [];
 
       // 添加会话结果
-      if (searchType.value === 'all' || searchType.value === 'session') {
-        allResults.push(...sessionResponse.data.map(r => ({ ...r, type: 'session' as SearchType })));
+      if (sessionResponse && (searchType.value === 'all' || searchType.value === 'session')) {
+        allResults.push(
+          ...sessionResponse.data.map((r) => ({ ...r, type: 'session' as SearchType })),
+        );
       }
 
       // 搜索 Agents
@@ -67,9 +79,13 @@ export const useSearchStore = defineStore('search', () => {
 
       // 按相关性排序
       results.value = allResults.sort((a, b) => b.rank - a.rank).slice(0, 50);
+      const sessionTotal = sessionResponse?.pagination.total ?? 0;
+      const sessionCount = sessionResponse?.data.length ?? 0;
       pagination.value = {
-        ...sessionResponse.pagination,
-        total: sessionResponse.pagination.total + allResults.length - sessionResponse.data.length,
+        page: sessionResponse?.pagination.page ?? page,
+        pageSize: sessionResponse?.pagination.pageSize ?? pagination.value.pageSize,
+        totalPages: sessionResponse?.pagination.totalPages ?? 0,
+        total: sessionTotal + allResults.length - sessionCount,
       };
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Search failed';

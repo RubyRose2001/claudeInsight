@@ -6,7 +6,7 @@ import { useProjectStore } from './stores/projectStore';
 import { useModelProfileStore } from './stores/modelProfileStore';
 import GlobalSearch from './components/search/GlobalSearch.vue';
 const globalSearchRef = ref<InstanceType<typeof GlobalSearch> | null>(null);
-import { LayoutDashboard, History, Zap, Settings, Search, Cpu, ChevronDown, Check, X, FolderOpen } from 'lucide-vue-next';
+import { LayoutDashboard, History, Zap, Settings, Search, Cpu, ChevronDown, Check, X, FolderOpen, Terminal } from 'lucide-vue-next';
 import { computed } from 'vue';
 
 const route = useRoute();
@@ -76,6 +76,14 @@ async function activateProfile(profileId: string) {
         >
           <History class="w-4 h-4" />
           <span class="text-sm font-medium">会话</span>
+        </RouterLink>
+        <RouterLink
+          to="/live-sessions"
+          class="flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors"
+          :class="route.path === '/live-sessions' ? 'bg-primary/10 text-primary' : 'hover:bg-muted'"
+        >
+          <Terminal class="w-4 h-4" />
+          <span class="text-sm font-medium">活跃会话</span>
         </RouterLink>
         <RouterLink
           to="/assets"
